@@ -1,0 +1,34 @@
+# Python build/cache outputs
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment folder
+venv/
+env/
+ENV/
+
+# Configuration and secrets (CRITICAL)
+.env
+.env.*
+!.env.example
+
+# Database files (SQLite history/WAL logs)
+db/*.db
+db/*.db-wal
+db/*.db-shm
+
+# Dynamic compiled skills (keep the directory but ignore generated skills)
+skills/dynamic/*
+!skills/dynamic/__init__.py
+
+# IDE / Editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Log files
+*.log

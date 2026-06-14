@@ -1,0 +1,166 @@
+智能多体系统 (Project Hermes-ADK 2.0)
+最终开发需求规格说明书 (PRD v5.0)
+
+---
+
+## 一、 系统架构与模块职责划分
+
+系统运行于配置有 XFCE 桌面环境的 Ubuntu 宿主机上，整体架构由 Telegram 网关、Redis 锁与状态中心、SQLite 任务持久化数据库、调度引擎以及各领域的 Subagents 构成：
+
+```
+┌────────────────────────────────────────────────────────┐
+│                      用户界面 (Telegram)               │
+└───────────────────────────┬────────────────────────────┘
+                            │ (HTTPS API 异步交互)
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│             网关守护进程 (Telegram Gateway Daemon)      │
+└───────────────────────────┬────────────────────────────┘
+                            │ (写 SQLite & 读取 Redis)
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│        Redis 锁与状态引擎 & SQLite 任务队列数据库      │
+└───────────────────────────┬────────────────────────────┘
+                            │ (状态分配、并发 Redis 独占锁、Drain 状态)
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│                  ADK Workflow 核心引擎                 │
+└──────┬────────────────────┼────────────────────┬───────┘
+       │                    │                    │
+       ▼ (Task API)         ▼ (Task API)         ▼ (Task API)
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  Subagent 1  │    │  Subagent 2  │    │  Subagent 3  │
+│  (Developer) │    │  (Finance)   │    │ (Scheduler)  │
+└──────┬───────┘    └──────┬───────┘    └──────┬───────┘
+       │                    │                    │
+       ▼ (GenAI Sandbox API)▼ (Playwright-CDP)   ▼ (Daemon Loop)
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│ Antigravity  │    │Host Chromium │    │ Redis &      │
+│ Cloud Sandbox│    │(CDP 9222)    │    │ Cron Engine  │
+└──────────────┘    └──────────────┘    └──────────────┘
+```
+
+### 1. 目录结构设计 (Workspace Layout)
+```text
+hermes-adk/
+├── config.py                 # 全局配置 (模型解耦、Tokens, Chrome 路径等)
+├── main.py                   # 系统统一启动入口 (并发启动 Gateway 与 Scheduler)
+├── db/
+│   ├── database.py           # SQLite 初始化、连接池管理及 Dynamic Skill 注册表
+│   └── state.db              # SQLite 物理数据库文件 (持久化任务与 Skill 状态)
+├── gateway/
+│   ├── tg_bot.py             # Telegram 守护进程 (异步长轮询 / 注册 /skills 命令)
+│   └── handlers.py           # 消息事件处理器 (含 /skills 信息检索展示)
+├── scheduler/
+│   └── heartbeat.py          # 定时心跳与队列分配程序 (含 MockRedis 自动降级机制)
+├── agents/
+│   ├── workflow_router.py    # ADK 2.0 Workflow 主路由
+│   ├── developer_agent.py    # Subagent 1 (负责调用 Antigravity 并拉取 Snapshot & 注册 Skill)
+│   ├── finance_agent.py      # Subagent 2 (负责通过宿主机 CDP 抓取数据并分析)
+│   └── scheduler_agent.py    # Subagent 3 (负责自然语言 Cron 注册)
+├── skills/                   # 热加载本地 Skill 库
+│   ├── __init__.py
+│   ├── static/               # 预置静态 Skill 目录
+│   └── dynamic/              # Subagent 1 自动下载并生成的本地 Skill 目录
+└── tools/
+    ├── browser_tool.py       # Chromium CDP 桥接连接器 (Context 级别连接与清理)
+    └── antigravity_client.py # Gemini Interactions API & Sandbox 快照下载器 (使用 ANTIGRAVITY_MODEL)
+```
+
+---
+
+## 二、 数据库结构设计 (SQLite & Redis)
+
+### 1. SQLite Schema (`db/state.db`)
+用于任务历史、产物归档和定时规则的强持久化。
+```sql
+-- 1. 任务与执行队列状态表
+CREATE TABLE IF NOT EXISTS task_queue (
+    task_id TEXT PRIMARY KEY,                       -- 任务UUID (e.g., 'task_123456')
+    source TEXT NOT NULL,                           -- 'telegram' 或 'cron'
+    tg_chat_id INTEGER,                             -- 绑定的 Telegram Chat ID
+    tg_msg_id INTEGER,                              -- 绑定的 Telegram 消息 ID (用于原地编辑更新状态)
+    agent_type TEXT NOT NULL,                       -- 目标智能体: 'developer', 'finance', 'scheduler'
+    payload TEXT,                                   -- 任务参数，JSON 结构
+    status TEXT CHECK(status IN ('pending', 'running', 'paused', 'completed', 'failed')) DEFAULT 'pending',
+    session_id TEXT,                                -- ADK Session 序列化 ID，用于 Pause/Resume
+    result_data TEXT,                               -- 执行完毕输出的 Markdown / 结果数据
+    artifact_path TEXT,                             -- 生成的产物路径
+    error_log TEXT,                                 -- 错误栈信息
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. 定时任务配置表
+CREATE TABLE IF NOT EXISTS cron_schedules (
+    schedule_id TEXT PRIMARY KEY,                   -- 计划UUID
+    name TEXT NOT NULL,                             -- 定时任务别名
+    cron_expr TEXT NOT NULL,                        -- Crontab 表达式 (e.g., '0 9 * * 1-5')
+    task_payload TEXT NOT NULL,                     -- 触发时写入 task_queue 的 JSON 格式 Payload
+    is_active INTEGER DEFAULT 1,                    -- 1 为激活，0 为挂起
+    last_run_at TIMESTAMP,                          -- 上次触发时间
+    next_run_at TIMESTAMP                           -- 下次触发时间 (建表/激活时自动计算并填充)
+);
+
+-- 3. 动态 Skill 注册表 (Scheme A)
+CREATE TABLE IF NOT EXISTS skills (
+    skill_id TEXT PRIMARY KEY,                      -- Skill 唯一标识符
+    name TEXT NOT NULL UNIQUE,                      -- Skill 别名 (全局唯一)
+    path TEXT NOT NULL,                             -- 本地物理文件存储路径
+    sandbox_env_id TEXT,                            -- 产生该 Skill 的 Google Sandbox Env ID
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP  -- 注册创建时间
+);
+```
+
+### 2. Redis 键设计
+用于高并发排他锁、调度器模式控制与实时状态流转。
+* `lock:chrome_cdp_profile` (String): 当前独占 Chromium 实例的 `task_id`，设置 15 分钟 TTL 自动续期/释锁机制。
+* `scheduler:mode` (String): 调度器当前模式，可选值为 `"running"` (正常调度), `"draining"` (排空浏览器任务), `"offline"` (挂起所有调度以重启浏览器)。
+* `task:status:{task_id}` (Hash): 包含状态、进度等实时数据，通过 Pub/Sub 广播状态给网关。
+
+---
+
+## 三、 核心流程实现规范
+
+### 阶段 1：TG Gateway 异步交互与应答解耦
+1. **消息接收**：`gateway/tg_bot.py` 长轮询接收用户命令。
+2. **入库记录**：生成 UUID，向 SQLite 插入 `pending` 状态记录，并在 Redis 中同步注册任务占位。
+3. **即时应答**：向用户反馈“*任务已受理，正在排队（ID: {task_id}）*”。
+4. **异步状态流转**：网关后台跑一个异步事件轮询（或通过 Redis Pub/Sub 订阅），当任务状态变为 `running` / `completed` / `failed` 时，调用 Telegram API 编辑/覆盖初始排队消息。
+
+### 阶段 2：Scheduler 异步心跳与排空维护机制
+1. **Cron 精确触发**：调度程序通过检索 `next_run_at <= NOW` 提取已到期任务，避免每 10 秒轮询时的重复计算。
+2. **异步高并发派发**：改用非阻塞协程机制，任务分发后立即释放心跳线程；非冲突任务（如普通开发任务）可以并行启动。
+3. **安全重启排空机制 (Drain Mode)**：
+   * 每日 03:50 自动将 `scheduler:mode` 置为 `"draining"`。此时不再派发任何需要 `chrome_cdp_profile` 锁的 `finance` 任务。
+   * 检测到 `lock:chrome_cdp_profile` 为空且模式为 `draining` 时，将状态置为 `"offline"`。
+   * 杀死 Chromium 并清理 `/Cache`，重启拉起并监听 9222。
+   * 04:00 重置模式为 `"running"`。
+
+### 阶段 3：宿主机 Chromium CDP 独占式控制
+1. **Chromium 状态共享**：通过配置 `--user-data-dir` 保持用户的手动登录 Cookie，不再在自动化代码中编写滑块或验证码识别。
+2. **Playwright CDP 封装**：`tools/browser_tool.py` 严格区分 `contexts` 级别清理与 `browser` 关闭。
+```python
+class CDPConnectionManager:
+    async def __aenter__(self):
+        self.playwright = await async_playwright().start()
+        self.browser = await self.playwright.chromium.connect_over_cdp("http://127.0.0.1:9222")
+        self.context = self.browser.contexts[0]
+        return self.context
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        # 严禁在此处调用 self.browser.close()
+        await self.playwright.stop()
+```
+3. **锁控制转移**：底层函数只负责控制 `page` 的开关，全局锁的申请与释放全部上交至任务流控制器处理。
+
+### 阶段 4：Google Antigravity 托管沙箱 Skill 热加载
+1. **模型解耦配置**：
+   - 任务编排与普通任务处理默认使用通用低延迟模型 `gemini-3.5-flash` (`ORCHESTRATOR_MODEL`)。
+   - 远程编译、代码自愈测试默认使用专有预览模型 `antigravity-preview-05-2026` (`ANTIGRAVITY_MODEL`)。
+2. **隔离测试**：通过 Interactions API 挂载动态代码与 Pytest 单元测试到 Google Cloud 托管沙箱（使用 `ANTIGRAVITY_MODEL`）。
+3. **多轮自愈 (Self-Repair)**：通过在 `client.interactions.create` 中链式传递 `previous_interaction_id=last_id` 确保会话不分叉，最多循环自愈 3 次。
+4. **打包下载 (Snapshot Download)**：测试通过后，通过 API 请求下载沙箱打包镜像：
+   `GET https://generativelanguage.googleapis.com/v1beta/files/environment-{env_id}:download`
+   拉取 tar 压缩包并在本地 `skills/dynamic/` 下安全解压。
+5. **动态注册持久化 (Scheme A)**：技能本地提取成功后，调用 `register_skill(...)` 将相关元数据持久化存储至 SQLite 的 `skills` 表中。网关及调度中心可通过命令行或检索机制，对已登记的技能进行动态热加载或通过 Telegram `/skills` 交互指令进行展示。

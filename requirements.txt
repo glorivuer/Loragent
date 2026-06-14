@@ -1,0 +1,8 @@
+google-genai>=2.0.0
+playwright
+redis
+python-telegram-bot
+croniter
+httpx
+python-dotenv
+pytest
