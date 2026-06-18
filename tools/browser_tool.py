@@ -13,7 +13,7 @@ class CDPConnectionManager:
         self.context = None
 
     async def __aenter__(self):
-        logger.info(f"Connecting to Chromium CDP at {self.cdp_url}...")
+        logger.info(f"Connecting to Chrome CDP at {self.cdp_url}...")
         self.playwright = await async_playwright().start()
         try:
             self.browser = await self.playwright.chromium.connect_over_cdp(self.cdp_url)

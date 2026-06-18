@@ -43,10 +43,22 @@ def init_db():
         result_data TEXT,
         artifact_path TEXT,
         error_log TEXT,
+        tg_notified_status TEXT DEFAULT 'pending',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
+    
+    # Safe migration: Add tg_notified_status column if it does not exist in an existing database
+    cursor.execute("PRAGMA table_info(task_queue);")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "tg_notified_status" not in columns:
+        try:
+            cursor.execute("ALTER TABLE task_queue ADD COLUMN tg_notified_status TEXT DEFAULT 'pending';")
+            logger.info("Migrated task_queue table: added tg_notified_status column.")
+        except Exception as ex:
+            logger.error(f"Failed to add tg_notified_status column: {ex}")
+
     
     # 2. Create cron_schedules table
     cursor.execute("""
@@ -108,7 +120,7 @@ def get_task(task_id: str) -> dict:
         return res
     return None
 
-def update_task_status(task_id: str, status: str, result_data: str = None, error_log: str = None, artifact_path: str = None) -> bool:
+def update_task_status(task_id: str, status: str, result_data: str = None, error_log: str = None, artifact_path: str = None, tg_notified_status: str = None) -> bool:
     try:
         conn = get_db_conn()
         cursor = conn.cursor()
@@ -127,9 +139,13 @@ def update_task_status(task_id: str, status: str, result_data: str = None, error
         if artifact_path is not None:
             updates.append("artifact_path = ?")
             params.append(artifact_path)
+        if tg_notified_status is not None:
+            updates.append("tg_notified_status = ?")
+            params.append(tg_notified_status)
             
         params.append(task_id)
         query = f"UPDATE task_queue SET {', '.join(updates)} WHERE task_id = ?"
+
         
         cursor.execute(query, tuple(params))
         conn.commit()
@@ -230,3 +246,72 @@ def get_registered_skills() -> list:
     except Exception as e:
         logger.error(f"Failed to fetch registered skills: {e}")
         return []
+
+def get_all_skills() -> list:
+    """Fetches all registered dynamic skills from database and static skills from directory."""
+    import os
+    skills = []
+    
+    # 1. Scan static skills directory
+    static_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "skills", "static")
+    if os.path.exists(static_dir):
+        try:
+            for item in os.listdir(static_dir):
+                item_path = os.path.join(static_dir, item)
+                if os.path.isdir(item_path):
+                    skill_md = os.path.join(item_path, "SKILL.md")
+                    if os.path.exists(skill_md):
+                        # Parse description from frontmatter
+                        desc = "A pre-installed static skill."
+                        try:
+                            with open(skill_md, "r", encoding="utf-8") as f:
+                                content = f.read()
+                            if content.startswith("---"):
+                                parts = content.split("---", 2)
+                                if len(parts) >= 3:
+                                    for line in parts[1].split("\n"):
+                                        if line.strip().startswith("description:"):
+                                            desc = line.split(":", 1)[1].strip().strip('"').strip("'")
+                                            break
+                        except Exception:
+                            pass
+                        
+                        skills.append({
+                            "skill_id": f"static_{item}",
+                            "name": item,
+                            "path": skill_md,
+                            "sandbox_env_id": "static",
+                            "created_at": "pre-installed",
+                            "description": desc
+                        })
+        except Exception as se:
+            logger.error(f"Failed to scan static skills: {se}")
+                    
+    # 2. Get dynamic skills from SQLite
+    try:
+        conn = get_db_conn()
+        cursor = conn.cursor()
+        rows = cursor.execute("SELECT * FROM skills ORDER BY name ASC").fetchall()
+        conn.close()
+        for r in rows:
+            d = dict(r)
+            desc = "A custom dynamic skill."
+            try:
+                if os.path.exists(d['path']):
+                    with open(d['path'], "r", encoding="utf-8") as f:
+                        content = f.read()
+                    if content.startswith("---"):
+                        parts = content.split("---", 2)
+                        if len(parts) >= 3:
+                            for line in parts[1].split("\n"):
+                                if line.strip().startswith("description:"):
+                                    desc = line.split(":", 1)[1].strip().strip('"').strip("'")
+                                    break
+            except Exception:
+                pass
+            d['description'] = desc
+            skills.append(d)
+    except Exception as e:
+        logger.error(f"Failed to fetch registered skills: {e}")
+        
+    return sorted(skills, key=lambda x: x['name'])

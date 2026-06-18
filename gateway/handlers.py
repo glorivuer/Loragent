@@ -3,7 +3,7 @@ import json
 import logging
 from telegram import Update
 from telegram.ext import ContextTypes
-from db.database import add_task, add_cron_schedule, get_registered_skills
+from db.database import add_task, add_cron_schedule, get_registered_skills, get_all_skills
 from google import genai
 from google.genai import types
 from config import GEMINI_API_KEY, ORCHESTRATOR_MODEL
@@ -128,22 +128,28 @@ async def handle_cron(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Failed to register schedule in database.")
 
 async def handle_list_skills(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command handler for /skills to list registered dynamic skills."""
-    skills = get_registered_skills()
+    """Command handler for /skills to list all static and dynamic skills."""
+    import html
+    skills = get_all_skills()
     if not skills:
-        await update.message.reply_text("🗂️ No dynamic skills registered in database.")
+        await update.message.reply_text("🗂️ No dynamic or static skills registered.")
         return
         
-    text = "🗂️ **Registered Dynamic Skills**:\n\n"
+    text = "🗂️ <b>Available Skills (Static & Dynamic)</b>:\n\n"
     for s in skills:
         # Get path relative to Hmsdk
         rel_path = s['path'].split("Hmsdk/")[-1] if "Hmsdk/" in s['path'] else s['path']
-        text += f"🔹 **Name**: `{s['name']}`\n"
-        text += f"   *Path*: `{rel_path}`\n"
-        text += f"   *Env ID*: `{s['sandbox_env_id']}`\n"
-        text += f"   *Compiled*: {s['created_at']}\n\n"
+        name_esc = html.escape(s['name'])
+        path_esc = html.escape(rel_path)
+        type_str = 'Static (Pre-installed)' if s['sandbox_env_id'] == 'static' else 'Dynamic'
+        desc_esc = html.escape(s.get('description', 'No description.'))
         
-    await update.message.reply_text(text, parse_mode="Markdown")
+        text += f"🔹 <b>Name</b>: <code>{name_esc}</code>\n"
+        text += f"   <i>Path</i>: <code>{path_esc}</code>\n"
+        text += f"   <i>Type</i>: {type_str}\n"
+        text += f"   <i>Description</i>: {desc_esc}\n\n"
+        
+    await update.message.reply_text(text, parse_mode="HTML")
 
 async def handle_unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -160,32 +166,48 @@ async def handle_unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else genai.Client()
     
-    prompt = (
-        f"You are the Orchestrator (Main Agent) of the Hermes-ADK 2.0 AI system. "
-        f"Analyze the user's message and determine if it's general conversation/question, or if it requests "
-        f"a specific action that should be delegated to one of our specialized subagents:\n"
-        f"- Developer Agent: Handles coding requests, writing python modules, compiling skills, or sandboxed tests.\n"
-        f"- Finance Agent: Handles fetching and analyzing financial/stock/business news from a specific web URL.\n"
-        f"- Scheduler Agent: Handles setting up cron schedules or recurring tasks from natural language descriptions.\n\n"
-        f"User message: \"{user_text}\"\n\n"
-        f"Classify the intent and reply in a strict JSON format matching this schema:\n"
-        f"{{\n"
-        f"  \"action\": \"direct_response\" | \"route_developer\" | \"route_finance\" | \"route_scheduler\",\n"
-        f"  \"response\": \"Markdown text response if action is direct_response, else empty.\",\n"
-        f"  \"payload\": {{\n"
-        f"     # if route_developer: {{\"query\": \"user query\"}}\n"
-        f"     # if route_finance: {{\"url\": \"http://extracted-url-to-scrape\"}}\n"
-        f"     # if route_scheduler: {{\"query\": \"schedule description\"}}\n"
-        f"  }}\n"
-        f"}}\n"
-        f"Ensure all double quotes are properly escaped to make the response a valid JSON."
+    # Fetch registered skills dynamically to make Orchestrator aware of them
+    skills = get_all_skills()
+    skills_list_str = ""
+    for s in skills:
+        skills_list_str += f"- Skill Name: `{s['name']}` (Type: {'Static' if s['sandbox_env_id'] == 'static' else 'Dynamic'}, Path: `{s['path']}`)\n"
+    
+    system_instruction = (
+        "You are the Orchestrator (Main Agent) of the Hermes-ADK 2.0 AI system.\n"
+        "Analyze the user's message and determine if it's general conversation/question, or if it requests "
+        "a specific action that should be delegated to one of our specialized subagents:\n"
+        "- Developer Agent: Handles coding requests, writing python modules, compiling/creating new skills, running sandboxed/local tests, or executing an existing dynamic skill.\n"
+        "- Finance Agent: Handles fetching and analyzing financial/stock/business news from a specific web URL.\n"
+        "- Scheduler Agent: Handles setting up cron schedules or recurring tasks from natural language descriptions.\n"
+        "- General Agent: Handles general requests, questions, document/file analysis (e.g. reading/analyzing local files like karpathy.md), local workspace inspection, and shell command executions.\n\n"
+        f"Available Dynamic Skills registered in the database:\n{skills_list_str or 'None'}\n\n"
+        "Instructions:\n"
+        "1. If the user wants to execute/run an existing dynamic skill (e.g. 'run skill calculate_fibonacci with arg 10' or 'use skill X to ...'), "
+        "you should delegate to the Developer Agent (action: 'route_developer') with the query detailing the execution request.\n"
+        "2. If the user asks general questions or asks to analyze, view, or parse local documents or files (like karpathy.md), "
+        "delegate to the General Agent (action: 'route_general').\n"
+        "3. Classify the intent and reply in a strict JSON format matching this schema:\n"
+        "{\n"
+        "  \"action\": \"direct_response\" | \"route_developer\" | \"route_finance\" | \"route_scheduler\" | \"route_general\",\n"
+        "  \"response\": \"Markdown text response if action is direct_response, else empty.\",\n"
+        "  \"payload\": {\n"
+        "     # if route_developer: {\"query\": \"user query\"}\n"
+        "     # if route_finance: {\"url\": \"http://extracted-url-to-scrape\"}\n"
+        "     # if route_scheduler: {\"query\": \"schedule description\"}\n"
+        "     # if route_general: {\"query\": \"user query\"}\n"
+        "  }\n"
+        "}\n"
+        "Ensure all double quotes are properly escaped to make the response a valid JSON."
     )
     
     try:
         response = client.models.generate_content(
             model=ORCHESTRATOR_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json")
+            contents=user_text,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json"
+            )
         )
         
         data = json.loads(response.text)
@@ -196,21 +218,29 @@ async def handle_unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"Orchestrator failed to classify intent: {e}. Raw response: {response.text if 'response' in locals() else ''}")
         await update.message.reply_text("🤖 Sorry, I had trouble understanding that. Please use a direct command or try again.")
         return
+
         
+    import html
+
     if action == "direct_response":
         if not direct_reply:
             direct_reply = "🤖 I'm here. How can I help you?"
-        await update.message.reply_text(direct_reply, parse_mode="Markdown")
+        # Fallback to direct text if markdown has parse errors
+        try:
+            await update.message.reply_text(direct_reply, parse_mode="Markdown")
+        except Exception:
+            await update.message.reply_text(direct_reply)
         
     elif action == "route_developer":
         dev_query = payload.get("query") or user_text
         task_id = f"task_dev_{uuid.uuid4().hex[:8]}"
+        safe_query = html.escape(dev_query)
         msg = await update.message.reply_text(
-            f"🧠 **Orchestrator**: Routing to **Developer Agent**...\n"
-            f"⏳ **Task Queued**\n"
-            f"🏷️ **ID**: `{task_id}`\n"
-            f"📝 **Query**: \"{dev_query}\"",
-            parse_mode="Markdown"
+            f"🧠 <b>Orchestrator</b>: Routing to <b>Developer Agent</b>...\n"
+            f"⏳ <b>Task Queued</b>\n"
+            f"🏷️ <b>ID</b>: <code>{task_id}</code>\n"
+            f"📝 <b>Query</b>: \"{safe_query}\"",
+            parse_mode="HTML"
         )
         add_task(
             task_id=task_id,
@@ -233,12 +263,13 @@ async def handle_unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
             
         task_id = f"task_fin_{uuid.uuid4().hex[:8]}"
+        safe_url = html.escape(url)
         msg = await update.message.reply_text(
-            f"🧠 **Orchestrator**: Routing to **Finance Agent**...\n"
-            f"⏳ **CDP Analysis Task Queued**\n"
-            f"🏷️ **ID**: `{task_id}`\n"
-            f"🔗 **Scraping**: {url}",
-            parse_mode="Markdown"
+            f"🧠 <b>Orchestrator</b>: Routing to <b>Finance Agent</b>...\n"
+            f"⏳ <b>CDP Analysis Task Queued</b>\n"
+            f"🏷️ <b>ID</b>: <code>{task_id}</code>\n"
+            f"🔗 <b>Scraping</b>: {safe_url}",
+            parse_mode="HTML"
         )
         add_task(
             task_id=task_id,
@@ -252,18 +283,39 @@ async def handle_unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif action == "route_scheduler":
         sch_query = payload.get("query") or user_text
         task_id = f"task_sch_{uuid.uuid4().hex[:8]}"
+        safe_sch = html.escape(sch_query)
         msg = await update.message.reply_text(
-            f"🧠 **Orchestrator**: Routing to **Scheduler Agent**...\n"
-            f"⏳ **Parsing Schedule Task Queued**\n"
-            f"🏷️ **ID**: `{task_id}`\n"
-            f"🕒 **Schedule**: \"{sch_query}\"",
-            parse_mode="Markdown"
+            f"🧠 <b>Orchestrator</b>: Routing to <b>Scheduler Agent</b>...\n"
+            f"⏳ <b>Parsing Schedule Task Queued</b>\n"
+            f"🏷️ <b>ID</b>: <code>{task_id}</code>\n"
+            f"🕒 <b>Schedule</b>: \"{safe_sch}\"",
+            parse_mode="HTML"
         )
         add_task(
             task_id=task_id,
             source="telegram",
             agent_type="scheduler",
             payload={"query": sch_query},
+            tg_chat_id=chat_id,
+            tg_msg_id=msg.message_id
+        )
+        
+    elif action == "route_general":
+        gen_query = payload.get("query") or user_text
+        task_id = f"task_gen_{uuid.uuid4().hex[:8]}"
+        safe_gen = html.escape(gen_query)
+        msg = await update.message.reply_text(
+            f"🧠 <b>Orchestrator</b>: Routing to <b>General Agent</b>...\n"
+            f"⏳ <b>Task Queued</b>\n"
+            f"🏷️ <b>ID</b>: <code>{task_id}</code>\n"
+            f"📝 <b>Query</b>: \"{safe_gen}\"",
+            parse_mode="HTML"
+        )
+        add_task(
+            task_id=task_id,
+            source="telegram",
+            agent_type="general",
+            payload={"query": gen_query},
             tg_chat_id=chat_id,
             tg_msg_id=msg.message_id
         )

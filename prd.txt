@@ -35,7 +35,7 @@
        │                    │                    │
        ▼ (GenAI Sandbox API)▼ (Playwright-CDP)   ▼ (Daemon Loop)
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│ Antigravity  │    │Host Chromium │    │ Redis &      │
+│ Antigravity  │    │ Host Chrome  │    │ Redis &      │
 │ Cloud Sandbox│    │(CDP 9222)    │    │ Cron Engine  │
 └──────────────┘    └──────────────┘    └──────────────┘
 ```
@@ -63,7 +63,7 @@ hermes-adk/
 │   ├── static/               # 预置静态 Skill 目录
 │   └── dynamic/              # Subagent 1 自动下载并生成的本地 Skill 目录
 └── tools/
-    ├── browser_tool.py       # Chromium CDP 桥接连接器 (Context 级别连接与清理)
+    ├── browser_tool.py       # Chrome CDP 桥接连接器 (Context 级别连接与清理)
     └── antigravity_client.py # Gemini Interactions API & Sandbox 快照下载器 (使用 ANTIGRAVITY_MODEL)
 ```
 
@@ -134,11 +134,11 @@ CREATE TABLE IF NOT EXISTS skills (
 3. **安全重启排空机制 (Drain Mode)**：
    * 每日 03:50 自动将 `scheduler:mode` 置为 `"draining"`。此时不再派发任何需要 `chrome_cdp_profile` 锁的 `finance` 任务。
    * 检测到 `lock:chrome_cdp_profile` 为空且模式为 `draining` 时，将状态置为 `"offline"`。
-   * 杀死 Chromium 并清理 `/Cache`，重启拉起并监听 9222。
+   * 杀死 Chrome 并清理 `/Cache`，重启拉起并监听 9222。
    * 04:00 重置模式为 `"running"`。
 
-### 阶段 3：宿主机 Chromium CDP 独占式控制
-1. **Chromium 状态共享**：通过配置 `--user-data-dir` 保持用户的手动登录 Cookie，不再在自动化代码中编写滑块或验证码识别。
+### 阶段 3：宿主机 Chrome CDP 独占式控制
+1. **Chrome 状态共享**：通过配置 `--user-data-dir` 保持用户的手动登录 Cookie，不再在自动化代码中编写滑块或验证码识别。
 2. **Playwright CDP 封装**：`tools/browser_tool.py` 严格区分 `contexts` 级别清理与 `browser` 关闭。
 ```python
 class CDPConnectionManager:
